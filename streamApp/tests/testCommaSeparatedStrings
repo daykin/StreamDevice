@@ -1,0 +1,58 @@
+#!/usr/bin/env tclsh
+source streamtestlib.tcl
+
+# Define records, protocol and startup (text goes to files)
+# The asynPort "device" is connected to a network TCP socket
+# Talk to the socket with send/receive/assure
+# Send commands to the ioc shell with ioccmd
+
+set records {
+    record (waveform, "CSS:spaceSeparated")
+    {
+        field (DTYP, "stream")
+        field (FTVL, "STRING")
+        field (NELM, "3")
+        field (INP,  "@test.proto testspace device")
+    }
+    record (waveform, "CSS:commaSeparated")
+    {
+        field (DTYP, "stream")
+        field (FTVL, "STRING")
+        field (NELM, "3")
+        field (INP, "@test.proto testcomma device")
+    }
+}
+
+set protocol {
+    Terminator = LF;
+    testspace {
+        Separator = "\_";
+        @mismatch {out "mismatch after %(NORD)d elements: %s\n"}
+        in "start %s end"; out "%(NORD)d elements: %s";
+    }
+    testcomma{
+        Separator = ",";
+        @mismatch {out "mismatch after %(NORD)d elements: %s\n"}
+        in "start %s end"; out "%(NORD)d elements: %s";
+    }
+}
+
+set startup {
+}
+
+set debug 0
+
+startioc
+
+process CSS:spaceSeparated
+send "start foo bar baz end\n"
+assure "3 elements: foo bar baz\n"
+
+process CSS:commaSeparated
+send "start foo,bar,baz end\n"
+assure "3 elements: foo,bar,baz\n"
+process CSS:commaSeparated
+send "start foo, bar, baz end\n"
+assure "3 elements: foo, bar, baz\n"
+
+finish
