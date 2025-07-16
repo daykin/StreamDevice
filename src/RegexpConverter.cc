@@ -24,7 +24,11 @@
 #include <limits.h>
 #include <ctype.h>
 
-#include "pcre.h"
+#define PCRE2_CODE_UNIT_WIDTH 8
+#define GROUP_START(ov, i) (ov[(i)*2])
+#define GROUP_END(ov, i) (ov[(i)*2+1])
+#define GROUP_LEN(ov, i) (GROUP_END(ov,i)-GROUP_START(ov,i))
+#include "pcre2.h"
 
 #include "StreamFormatConverter.h"
 #include "StreamError.h"
@@ -89,17 +93,19 @@ parse(const StreamFormat& fmt, StreamBuffer& info,
     source++;
     debug("regexp = \"%s\"\n", pattern.expand()());
 
-    const char* errormsg;
-    int eoffset;
+    int errorcode;
+    PCRE2_SIZE eoffset;
     int nsubexpr;
 
-    pcre* code = pcre_compile(pattern(), 0, &errormsg, &eoffset, NULL);
+    pcre2_code* code = pcre2_compile((PCRE2_SPTR)pattern(), PCRE2_ZERO_TERMINATED, 0, &errorcode, &eoffset, NULL);
     if (!code)
     {
+        PCRE2_UCHAR errormsg[256];
+        pcre2_get_error_message(errorcode,errormsg,sizeof(errormsg));
         error("%s after \"%s\"\n", errormsg, pattern.expand(0, eoffset)());
         return false;
     }
-    pcre_fullinfo(code, NULL, PCRE_INFO_CAPTURECOUNT, &nsubexpr);
+    pcre2_pattern_info(code, PCRE2_INFO_CAPTURECOUNT, &nsubexpr);
     if (fmt.prec > nsubexpr)
     {
         error("Sub-expression index is %ld but pattern has only %d sub-expression\n", fmt.prec, nsubexpr);
@@ -134,11 +140,12 @@ ssize_t RegexpConverter::
 scanString(const StreamFormat& fmt, const char* input,
     char* value, size_t& size)
 {
-    int ovector[30];
     int rc;
     size_t l;
     const char* info = fmt.info;
-    pcre* code = extract<pcre*>(info);
+    pcre2_code* code = extract<pcre2_code*>(info);
+    pcre2_match_data* match_data;
+    match_data = pcre2_match_data_create_from_pattern(code, NULL);
     size_t length = fmt.width > 0 ? fmt.width : strlen(input);
     int subexpr = fmt.prec > 0 ? fmt.prec : 0;
 
@@ -147,38 +154,45 @@ scanString(const StreamFormat& fmt, const char* input,
     debug("input = \"%s\"\n", input);
     debug("length=%" Z "u\n", length);
 
-    rc = pcre_exec(code, NULL, input, (int)length, 0, 0, ovector, 30);
-    debug("pcre_exec match \"%.*s\" result = %d\n", (int)length, input, rc);
+    rc = pcre2_match(code, (PCRE2_SPTR)input, (int)length, 0, 0, match_data, NULL);
+    debug("pcre_match match \"%.*s\" result = %d\n", (int)length, input, rc);
     if ((subexpr && rc <= subexpr) || rc < 0)
     {
         // error or no match or not enough sub-expressions
+        pcre2_match_data_free(match_data);
         return -1;
     }
+
+    PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+
     if (fmt.flags & skip_flag) return ovector[subexpr*2+1];
 
-    l = ovector[subexpr*2+1] - ovector[subexpr*2];
+    l = GROUP_LEN(ovector,subexpr);
     if (l >= size) {
         if (!(fmt.flags & sign_flag)) {
             error("Regexp: Matching string \"%s\" too long (%" Z "u>%" Z "u bytes). You may want to try the + flag: \"%%+/.../\"\n",
                 StreamBuffer(input + ovector[subexpr*2],l).expand()(),
                 l, size-1);
+            pcre2_match_data_free(match_data);
             return -1;
         }
         l = size-1;
     }
-    memcpy(value, input + ovector[subexpr*2], l);
+    memcpy(value, input + GROUP_START(ovector,subexpr), l);
     value[l] = '\0';
     size = l+1; // update number of bytes written to value
+    pcre2_match_data_free(match_data);
     return ovector[1]; // consume input until end of match
 }
 
 static void regsubst(const StreamFormat& fmt, StreamBuffer& buffer, size_t start)
 {
     const char* subst = fmt.info;
-    pcre* code = extract<pcre*>(subst);
+    pcre2_code* code = extract<pcre2_code*>(subst);
     size_t length, c;
     int rc, l, r, rl, n;
-    int ovector[30];
+    pcre2_match_data* match_data;
+    match_data = pcre2_match_data_create_from_pattern(code,NULL);
     StreamBuffer s;
 
     length = buffer.length() - start;
@@ -194,15 +208,19 @@ static void regsubst(const StreamFormat& fmt, StreamBuffer& buffer, size_t start
 
     for (c = 0, n = 1; c < length; n++)
     {
-        rc = pcre_exec(code, NULL, buffer(start+c), (int)(length-c), 0, 0, ovector, 30);
+        rc = pcre2_match(code, (PCRE2_SPTR)buffer(start+c), (int)(length-c), 0, 0, match_data, NULL);
         debug("pcre_exec match \"%s\" result = %d\n", buffer.expand(start+c, length-c)(), rc);
 
         if (rc < 0) // no match
         {
             debug("pcre_exec: no match\n");
+            pcre2_match_data_free(match_data);
             break;
         }
-        l = ovector[1] - ovector[0];
+
+        PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+
+        l = GROUP_LEN(ovector,0);
 
         // no prec: replace all matches
         // prec with + flag: replace first prec matches
@@ -211,10 +229,10 @@ static void regsubst(const StreamFormat& fmt, StreamBuffer& buffer, size_t start
         if ((fmt.flags & sign_flag) || n >= fmt.prec)
         {
             // replace subexpressions
-            debug("before [%d]= \"%s\"\n", ovector[0], buffer.expand(start+c,ovector[0])());
+            debug("before [%ld]= \"%s\"\n", ovector[0], buffer.expand(start+c,ovector[0])());
             debug("match  [%d]= \"%s\"\n", l, buffer.expand(start+c+ovector[0],l)());
             for (r = 1; r < rc; r++)
-                debug("sub%d = \"%s\"\n", r, buffer.expand(start+c+ovector[r*2], ovector[r*2+1]-ovector[r*2])());
+                debug("sub%d = \"%s\"\n", r, buffer.expand(start+c+GROUP_START(ovector,r), GROUP_LEN(ovector, r))());
             debug("after     = \"%s\"\n", buffer.expand(start+c+ovector[1])());
             s = subst;
             debug("subs      = \"%s\"\n", s.expand()());
@@ -235,7 +253,7 @@ static void regsubst(const StreamFormat& fmt, StreamBuffer& buffer, size_t start
                             continue;
                         }
                         br *= 2;
-                        rl = ovector[br+1] - ovector[br];
+                        rl = GROUP_LEN(ovector,br);
                         s.replace(r, 3, buffer(start+c+ovector[br]), rl);
                         switch (ch)
                         {
@@ -258,10 +276,9 @@ static void regsubst(const StreamFormat& fmt, StreamBuffer& buffer, size_t start
                     else if (ch != 0 && ch < rc) // escaped 1 - 9 : replace with subexpr
                     {
                         debug("found escaped \\%u\n", ch);
-                        ch *= 2;
-                        rl = ovector[ch+1] - ovector[ch];
-                        debug("yes, replace \\%d: \"%s\"\n", ch/2, buffer.expand(start+c+ovector[ch], rl)());
-                        s.replace(r, 2, buffer(start+c+ovector[ch]), rl);
+                        rl = GROUP_LEN(ovector, ch);
+                        debug("yes, replace \\%d: \"%s\"\n", ch, buffer.expand(start+c+GROUP_START(ovector,ch), rl)());
+                        s.replace(r, 2, buffer(start+c+GROUP_START(ovector,ch)), rl);
                         r += rl - 1;
                     }
                     else
@@ -297,6 +314,7 @@ static void regsubst(const StreamFormat& fmt, StreamBuffer& buffer, size_t start
         }
     }
     debug("pcre_exec converted string: %s\n", buffer.expand()());
+    pcre2_match_data_free(match_data);
 }
 
 ssize_t RegexpConverter::
